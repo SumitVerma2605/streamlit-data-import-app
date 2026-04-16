@@ -1,60 +1,174 @@
-version: '3.8'
+version: '3.9'
 
 services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # POSTGRES DATABASE
+  # ═══════════════════════════════════════════════════════════════════════════
   postgres:
-    image: postgres:latest
-    restart: always
+    image: postgres:15-alpine
+    container_name: ide_postgres
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: database
+      POSTGRES_USER: ${DB_USER:-datauser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_123}
+      POSTGRES_DB: ${DB_NAME:-dataflow}
+      POSTGRES_INITDB_ARGS: "-c timezone=UTC"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./db/migrations:/migrations
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-datauser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ide_network
+    restart: unless-stopped
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # REDIS CACHE & MESSAGE BROKER
+  # ═══════════════════════════════════════════════════════════════════════════
   redis:
-    image: redis:latest
-    restart: always
+    image: redis:7-alpine
+    container_name: ide_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secure_pass}
+    volumes:
+      - redis_data:/data
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ide_network
+    restart: unless-stopped
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BACKEND API MICROSERVICE (FastAPI)
+  # ═══════════════════════════════════════════════════════════════════════════
   backend:
-    build: ./backend
-    restart: always
+    build:
+      context: ./backend-api
+      dockerfile: Dockerfile
+    container_name: ide_backend
     environment:
-      DATABASE_URL: postgres://user:password@postgres:5432/database
+      DATABASE_URL: postgresql://${DB_USER:-datauser}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-dataflow}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_pass}@redis:6379/0
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      ENV: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend-api:/app
+      - /app/__pycache__
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ide_network
+    restart: unless-stopped
+    command: python main.py
+
+  # ════════════════════════════════════════════��══════════════════════════════
+  # DATA PROCESSOR MICROSERVICE (Celery Worker)
+  # ═══════════════════════════════════════════════════════════════════════════
+  processor:
+    build:
+      context: ./data-processor
+      dockerfile: Dockerfile
+    container_name: ide_processor
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-datauser}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-dataflow}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_pass}@redis:6379/1
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secure_pass}@redis:6379/0
+      ENV: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data-processor:/app
+      - ./uploads:/data/uploads
+      - /app/__pycache__
     depends_on:
       - postgres
       - redis
-    ports:
-      - "5000:5000"
+    networks:
+      - ide_network
+    restart: unless-stopped
+    command: celery -A app.tasks worker --loglevel=info
 
-  data_processor:
-    build: ./data_processor
-    restart: always
-    depends_on:
-      - backend
-    ports:
-      - "6000:6000"
-
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STREAMLIT FRONTEND
+  # ═══════════════════════════════════════════════════════════════════════════
   frontend:
-    build: ./frontend
-    restart: always
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ide_frontend
+    environment:
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_LOGGER_LEVEL: info
+      API_BASE_URL: http://backend:8000
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./frontend:/app
+      - /app/.streamlit/cache
+    ports:
+      - "8501:8501"
     depends_on:
       - backend
-    ports:
-      - "3000:3000"
+    networks:
+      - ide_network
+    restart: unless-stopped
+    command: streamlit run app.py --logger.level=info
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NGINX REVERSE PROXY & LOAD BALANCER
+  # ═══════════════════════════════════════════════════════════════════════════
   nginx:
-    image: nginx:latest
-    restart: always
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: ide_nginx
     ports:
       - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
     depends_on:
       - frontend
+      - backend
+    networks:
+      - ide_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  nginx_cache:
+    driver: local
+
+networks:
+  ide_network:
+    driver: bridge
